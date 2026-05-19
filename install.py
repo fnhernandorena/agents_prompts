@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["questionary"]
 # ///
 """
 Dev Workflows Installer
@@ -9,13 +9,15 @@ Run with: uv run install.py [--uninstall] [--dry-run]
 """
 
 import argparse
-import json
 import os
 import shutil
 import sys
 import urllib.request
 from pathlib import Path
 from datetime import datetime
+
+import questionary
+from questionary import Choice
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -102,28 +104,22 @@ TOOLS = [
     },
 ]
 
-# ─── ANSI colors ──────────────────────────────────────────────────────────────
-
-USE_COLOR = sys.stdout.isatty() and os.name != "nt"
-
-def c(text, code):
-    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
-
-def bold(t):  return c(t, "1")
-def green(t): return c(t, "32")
-def yellow(t):return c(t, "33")
-def red(t):   return c(t, "31")
-def cyan(t):  return c(t, "36")
-def dim(t):   return c(t, "2")
-
 # ─── Source detection ─────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 LOCAL_SKILLS = SCRIPT_DIR / "skills"
 SOURCE = "local" if LOCAL_SKILLS.exists() else "remote"
 
+def detect_tool(tool: dict) -> bool:
+    for path in tool["detect"]:
+        if path.exists():
+            return True
+    for binary in tool.get("binaries", []):
+        if shutil.which(binary):
+            return True
+    return False
+
 def get_skill_files(skill: str) -> dict[str, str]:
-    """Return {filename: content} for a skill, from local or remote."""
     if SOURCE == "local":
         result = {}
         for fname in ["SKILL.md", "prompt.md"]:
@@ -143,9 +139,7 @@ def get_skill_files(skill: str) -> dict[str, str]:
         return result
 
 def get_context_file(name: str) -> str:
-    """Fetch a root context file (CLAUDE.md, GEMINI.md, AGENTS.md)."""
     if SOURCE == "local":
-        # AGENTS.md is a symlink to CLAUDE.md
         src = "CLAUDE.md" if name == "AGENTS.md" else name
         path = SCRIPT_DIR / src
         if path.exists():
@@ -160,134 +154,6 @@ def get_context_file(name: str) -> str:
         except Exception as e:
             raise RuntimeError(f"Failed to fetch {url}: {e}") from e
 
-# ─── Interactive menus ────────────────────────────────────────────────────────
-
-def detect_tool(tool: dict) -> bool:
-    for path in tool["detect"]:
-        if path.exists():
-            return True
-    for binary in tool.get("binaries", []):
-        if shutil.which(binary):
-            return True
-    return False
-
-def _getch() -> str:
-    """Read one keypress. Returns 'up', 'down', 'enter', 'space', or the char."""
-    if os.name == "nt":
-        import msvcrt
-        ch = msvcrt.getch()
-        if ch in (b"\x00", b"\xe0"):
-            ch2 = msvcrt.getch()
-            if ch2 == b"H": return "up"
-            if ch2 == b"P": return "down"
-            return ""
-        if ch == b"\r":   return "enter"
-        if ch == b" ":    return "space"
-        if ch == b"\x03": raise KeyboardInterrupt
-        try: return ch.decode("utf-8").lower()
-        except: return ""
-    else:
-        import termios, tty, select
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = os.read(fd, 1)
-            if ch == b"\x1b":
-                # read rest of escape sequence in one shot
-                if select.select([fd], [], [], 0.1)[0]:
-                    rest = os.read(fd, 6)
-                    seq = ch + rest
-                    if seq[:3] == b"\x1b[A": return "up"
-                    if seq[:3] == b"\x1b[B": return "down"
-                return "esc"
-            if ch in (b"\r", b"\n"): return "enter"
-            if ch == b" ":           return "space"
-            if ch == b"\x03":        raise KeyboardInterrupt
-            if ch == b"\x04":        raise EOFError
-            try: return ch.decode("utf-8").lower()
-            except: return ""
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def _clear_lines(n: int):
-    if n > 0 and USE_COLOR:
-        sys.stdout.write(f"\033[{n}A\033[J")
-        sys.stdout.flush()
-
-
-def checkbox_menu(title: str, items: list[tuple[str, str]], pre_selected: set[int]) -> set[int]:
-    """Arrow-key + space checkbox. Returns selected indices."""
-    selected = set(pre_selected)
-    cursor = 0
-    n = len(items)
-    lines_drawn = 0
-    while True:
-        _clear_lines(lines_drawn)
-        out = [f"\n  {bold(title)}"]
-        for i, (name, desc) in enumerate(items):
-            ptr   = "▶" if i == cursor else " "
-            check = green("✓") if i in selected else dim("·")
-            nfmt  = bold(name) if i == cursor else name
-            out.append(f"  {ptr} [{check}] {nfmt:<28} {dim(desc)}")
-        out.append(f"\n  {dim('↑↓ move   space toggle   a all   n none   enter confirm')}")
-        block = "\n".join(out)
-        print(block)
-        lines_drawn = block.count("\n") + 1
-        try:
-            key = _getch()
-        except (KeyboardInterrupt, EOFError):
-            print(); sys.exit(0)
-        if   key == "up":    cursor = (cursor - 1) % n
-        elif key == "down":  cursor = (cursor + 1) % n
-        elif key == "space": selected ^= {cursor}
-        elif key == "a":     selected = set(range(n))
-        elif key == "n":     selected = set()
-        elif key in ("enter", "d"): return selected
-        elif key in ("q", "esc"):   print(); sys.exit(0)
-
-
-def radio_menu(title: str, options: list[str], descriptions: list[str] | None = None) -> int:
-    """Arrow-key radio menu. Returns selected index."""
-    cursor = 0
-    n = len(options)
-    descs = descriptions or [""] * n
-    lines_drawn = 0
-    while True:
-        _clear_lines(lines_drawn)
-        out = [f"\n  {bold(title)}"]
-        for i, (opt, desc) in enumerate(zip(options, descs)):
-            ptr  = "▶" if i == cursor else " "
-            ofmt = bold(opt) if i == cursor else opt
-            out.append(f"  {ptr}  {ofmt:<22} {dim(desc)}")
-        out.append(f"\n  {dim('↑↓ move   enter select')}")
-        block = "\n".join(out)
-        print(block)
-        lines_drawn = block.count("\n") + 1
-        try:
-            key = _getch()
-        except (KeyboardInterrupt, EOFError):
-            print(); sys.exit(0)
-        if   key == "up":   cursor = (cursor - 1) % n
-        elif key == "down": cursor = (cursor + 1) % n
-        elif key == "enter": return cursor
-        elif key in ("q", "esc"): print(); sys.exit(0)
-
-
-def confirm(prompt: str, default: bool = True) -> bool:
-    hint = f"{bold('Y')}/n" if default else f"y/{bold('N')}"
-    sys.stdout.write(f"\n  {prompt} [{hint}] ")
-    sys.stdout.flush()
-    try:
-        key = _getch()
-    except (KeyboardInterrupt, EOFError):
-        print(); sys.exit(0)
-    print()
-    if key == "enter":
-        return default
-    return key == "y" if not default else key != "n"
-
 # ─── Installation logic ───────────────────────────────────────────────────────
 
 def backup_path(p: Path) -> Path:
@@ -295,210 +161,223 @@ def backup_path(p: Path) -> Path:
     return p.with_suffix(f".bak_{ts}")
 
 def write_file(dest: Path, content: str, dry: bool) -> str:
-    """Write file, backup if exists. Returns status label."""
+    """Write file, backup if exists. Returns 'created' or 'updated'."""
     if dest.exists():
-        if dry:
-            return yellow("update")
-        shutil.copy2(dest, backup_path(dest))
-        dest.write_text(content, encoding="utf-8")
-        return yellow("updated")
+        if not dry:
+            shutil.copy2(dest, backup_path(dest))
+            dest.write_text(content, encoding="utf-8")
+        return "updated"
     else:
-        if dry:
-            return green("new")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-        return green("created")
+        if not dry:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        return "created"
 
-def install_skill(skill: str, dest_dir: Path, dry: bool) -> list[str]:
-    """Install SKILL.md + prompt.md into dest_dir/skill/. Returns log lines."""
-    log = []
-    try:
-        files = get_skill_files(skill)
-    except Exception as e:
-        return [f"  {red('ERROR')} {skill}: {e}"]
-    for fname, content in files.items():
-        dest = dest_dir / skill / fname
-        status = write_file(dest, content, dry)
-        log.append(f"  {status}  {dim(str(dest))}")
-    return log
+def install_tool(tool: dict, skills: list[str], base: Path, dry: bool) -> tuple[int, int, list[str]]:
+    """Install skills + context file for one tool. Returns (created, updated, errors)."""
+    created = updated = 0
+    errors = []
 
-def install_context_file(name: str, dest_dir: Path, dry: bool) -> list[str]:
-    try:
-        content = get_context_file(name)
-    except Exception as e:
-        return [f"  {red('ERROR')} {name}: {e}"]
-    dest = dest_dir / name
-    status = write_file(dest, content, dry)
-    return [f"  {status}  {dim(str(dest))}"]
+    if tool.get("files_per_skill") and skills:
+        for skill in skills:
+            try:
+                files = get_skill_files(skill)
+            except Exception as e:
+                errors.append(f"{skill}: {e}")
+                continue
+            for fname, content in files.items():
+                status = write_file(base / skill / fname, content, dry)
+                if status == "created": created += 1
+                else: updated += 1
 
-def uninstall_skill(skill: str, dest_dir: Path, dry: bool) -> list[str]:
-    skill_dir = dest_dir / skill
-    if not skill_dir.exists():
-        return [f"  {dim('skip')}   {dim(str(skill_dir))} (not found)"]
-    if dry:
-        return [f"  {red('remove')} {dim(str(skill_dir))}"]
-    shutil.rmtree(skill_dir)
-    return [f"  {red('removed')} {dim(str(skill_dir))}"]
+    if not tool.get("files_per_skill"):
+        ctx = tool.get("context_file", "CLAUDE.md")
+        try:
+            content = get_context_file(ctx)
+            status = write_file(base / ctx, content, dry)
+            if status == "created": created += 1
+            else: updated += 1
+        except Exception as e:
+            errors.append(f"{ctx}: {e}")
+
+    return created, updated, errors
+
+def uninstall_tool(tool: dict, skills: list[str], base: Path, dry: bool) -> tuple[int, list[str]]:
+    """Remove skills + context file for one tool. Returns (removed, errors)."""
+    removed = 0
+    errors = []
+
+    if tool.get("files_per_skill") and skills:
+        for skill in skills:
+            skill_dir = base / skill
+            if skill_dir.exists():
+                if not dry:
+                    shutil.rmtree(skill_dir)
+                removed += 1
+
+    if not tool.get("files_per_skill"):
+        ctx = tool.get("context_file", "CLAUDE.md")
+        dest = base / ctx
+        if dest.exists():
+            if not dry:
+                dest.unlink()
+            removed += 1
+
+    return removed, errors
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def abort(msg: str = "Aborted."):
+    print(f"\n  {msg}")
+    sys.exit(0)
+
 def main():
     parser = argparse.ArgumentParser(description="Dev Workflows installer")
-    parser.add_argument("--uninstall", action="store_true", help="Remove installed skills")
-    parser.add_argument("--dry-run",   action="store_true", help="Preview changes, write nothing")
+    parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--dry-run",   action="store_true")
     args = parser.parse_args()
 
     print()
-    print(bold("  ╔══════════════════════════════════════╗"))
-    print(bold("  ║       Dev Workflows Installer        ║"))
-    print(bold("  ╚══════════════════════════════════════╝"))
-    print(f"  Source: {cyan(SOURCE)}  |  Mode: {cyan('uninstall' if args.uninstall else 'install')}  |  Dry-run: {cyan(str(args.dry_run))}")
+    print("  ╔══════════════════════════════════════╗")
+    print("  ║       Dev Workflows Installer        ║")
+    print("  ╚══════════════════════════════════════╝")
+    mode = "uninstall" if args.uninstall else "install"
+    dry_tag = "  [dry-run]" if args.dry_run else ""
+    print(f"  source: {SOURCE}  |  mode: {mode}{dry_tag}\n")
 
     if SOURCE == "remote":
-        print(f"\n  {yellow('!')} Local skills/ not found. Files will be downloaded from GitHub.")
-        print(f"  Repo: {dim(REPO)}")
-        if not confirm("Continue with remote download?"):
-            sys.exit(0)
+        ok = questionary.confirm(
+            "Local skills/ not found. Download from GitHub?", default=True
+        ).ask()
+        if not ok:
+            abort()
 
-    # ── Step 1: Select tools ─────────────────────────────────────────────────
-    tool_items = [(t["name"], green("detected") if detect_tool(t) else dim("not detected")) for t in TOOLS]
-    pre_sel = {i for i, t in enumerate(TOOLS) if detect_tool(t)}
-    sel_tools = checkbox_menu("Select tools to install for:", tool_items, pre_sel)
-
-    if not sel_tools:
-        print(red("\n  No tools selected. Exiting."))
-        sys.exit(0)
-
-    selected_tools = [TOOLS[i] for i in sorted(sel_tools)]
+    # ── Step 1: Tools ────────────────────────────────────────────────────────
+    tool_choices = [
+        Choice(
+            title=f"{t['name']}  ({'detected' if detect_tool(t) else 'not detected'})",
+            value=t["id"],
+            checked=detect_tool(t),
+        )
+        for t in TOOLS
+    ]
+    selected_ids = questionary.checkbox(
+        "Select tools to install for:", choices=tool_choices
+    ).ask()
+    if not selected_ids:
+        abort("No tools selected.")
+    selected_tools = [t for t in TOOLS if t["id"] in selected_ids]
 
     # ── Step 2: Scope ────────────────────────────────────────────────────────
     global_paths  = "  ·  ".join(t.get("global_label",  "") for t in selected_tools)
     project_paths = "  ·  ".join(t.get("project_label", "") for t in selected_tools)
-    scope_idx = radio_menu(
-        "Where to install?",
-        ["Global", "This project", "Other path"],
-        [
-            f"all projects  →  {global_paths}",
-            f"here only     →  {project_paths}",
-            "specify a directory",
-        ],
-    )
 
-    if scope_idx == 0:
+    scope_choice = questionary.select(
+        "Where to install?",
+        choices=[
+            Choice(f"Global         ({global_paths})",  value="global"),
+            Choice(f"This project   ({project_paths})", value="project_current"),
+            Choice("Other path…",                       value="project_other"),
+        ],
+    ).ask()
+    if scope_choice is None:
+        abort()
+
+    if scope_choice == "global":
         scope = "global"
         project_dir = None
-    elif scope_idx == 1:
+    elif scope_choice == "project_current":
         scope = "project"
         project_dir = Path.cwd()
-        print(f"  Project: {cyan(str(project_dir))}")
     else:
         scope = "project"
-        sys.stdout.write(f"\n  {bold('Project path:')} ")
-        sys.stdout.flush()
-        try:
-            raw = input("").strip()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
+        raw = questionary.path("Project path:").ask()
+        if not raw:
+            abort()
         project_dir = Path(raw).expanduser().resolve()
         if not project_dir.exists():
-            print(red(f"  Path not found: {project_dir}"))
-            sys.exit(1)
-        print(f"  Project: {cyan(str(project_dir))}")
+            abort(f"Path not found: {project_dir}")
 
-    # ── Step 3: Select skills ────────────────────────────────────────────────
-    # Context-file-only tools (gemini, opencode) don't need skill selection
-    skill_tools = [t for t in selected_tools if t.get("files_per_skill")]
+    # ── Step 3: Skills ───────────────────────────────────────────────────────
+    skill_tools   = [t for t in selected_tools if t.get("files_per_skill")]
     context_tools = [t for t in selected_tools if not t.get("files_per_skill")]
 
-    selected_skills = []
+    selected_skills: list[str] = []
     if skill_tools:
-        skill_items = [(name, desc) for name, desc in SKILLS]
-        sel_skill_idx = checkbox_menu("Select skills to install:", skill_items, set(range(len(SKILLS))))
-        selected_skills = [SKILL_NAMES[i] for i in sorted(sel_skill_idx)]
-
+        skill_choices = [
+            Choice(title=f"{name}  —  {desc}", value=name, checked=True)
+            for name, desc in SKILLS
+        ]
+        selected_skills = questionary.checkbox(
+            "Select skills to install:", choices=skill_choices
+        ).ask() or []
         if not selected_skills and not context_tools:
-            print(red("\n  No skills selected. Exiting."))
-            sys.exit(0)
+            abort("No skills selected.")
 
-    # ── Step 4: Preview ──────────────────────────────────────────────────────
-    print(f"\n{bold('  Preview:')}")
-    print(f"  Tools:  {', '.join(t['name'] for t in selected_tools)}")
-    print(f"  Scope:  {scope}" + (f" → {project_dir}" if project_dir else ""))
+    # ── Step 4: Confirm ──────────────────────────────────────────────────────
+    scope_label = "global" if scope == "global" else str(project_dir)
+    print(f"\n  Tools : {', '.join(t['name'] for t in selected_tools)}")
+    print(f"  Scope : {scope_label}")
     if selected_skills:
-        print(f"  Skills: {', '.join(selected_skills)}")
-    if context_tools:
-        print(f"  Context files for: {', '.join(t['name'] for t in context_tools)}")
+        print(f"  Skills: {len(selected_skills)} selected")
     if args.dry_run:
-        print(f"\n  {yellow('DRY RUN — no files will be written.')}")
+        print("  [dry-run — no files will be written]")
 
-    print()
     action = "Uninstall" if args.uninstall else "Install"
-    if not confirm(f"{action}?"):
-        print("  Aborted.")
-        sys.exit(0)
+    ok = questionary.confirm(f"\n{action}?", default=True).ask()
+    if not ok:
+        abort()
 
     # ── Step 5: Execute ──────────────────────────────────────────────────────
     print()
-    errors = 0
+    total_errors: list[str] = []
 
     for tool in selected_tools:
-        print(bold(f"\n  ── {tool['name']} ──"))
-
         if scope == "global":
             base = tool.get("global_dir")
             if base is None:
-                print(f"  {yellow('!')} Global install not supported for {tool['name']}. Use project scope.")
+                print(f"  ⚠  {tool['name']}: global install not supported, skipped")
                 continue
+            dest_label = tool.get("global_label", str(base))
         else:
             base = project_dir / tool["project_subdir"]
+            dest_label = tool.get("project_label", str(base))
 
-        # Skills-based install
-        if tool.get("files_per_skill") and selected_skills:
-            for skill in selected_skills:
-                if args.uninstall:
-                    lines = uninstall_skill(skill, base, args.dry_run)
-                else:
-                    lines = install_skill(skill, base, args.dry_run)
-                for line in lines:
-                    print(line)
-                    if "ERROR" in line:
-                        errors += 1
-
-        # Context-file install
-        if not tool.get("files_per_skill"):
-            ctx = tool.get("context_file", "CLAUDE.md")
-            if args.uninstall:
-                dest = base / ctx
-                if dest.exists():
-                    if not args.dry_run:
-                        dest.unlink()
-                    print(f"  {red('removed')} {dim(str(dest))}")
-                else:
-                    print(f"  {dim('skip')}   {dim(str(base / ctx))} (not found)")
+        if args.uninstall:
+            removed, errors = uninstall_tool(tool, selected_skills, base, args.dry_run)
+            if errors:
+                print(f"  ✗  {tool['name']}: {len(errors)} error(s)")
+                for e in errors:
+                    print(f"       {e}")
+                total_errors.extend(errors)
             else:
-                lines = install_context_file(ctx, base, args.dry_run)
-                for line in lines:
-                    print(line)
-                    if "ERROR" in line:
-                        errors += 1
+                tag = "(dry-run)" if args.dry_run else ""
+                print(f"  ✓  {tool['name']}  —  {removed} item(s) removed  {tag}")
+        else:
+            created, updated, errors = install_tool(tool, selected_skills, base, args.dry_run)
+            if errors:
+                print(f"  ✗  {tool['name']}: {len(errors)} error(s)")
+                for e in errors:
+                    print(f"       {e}")
+                total_errors.extend(errors)
+            else:
+                tag = "(dry-run)" if args.dry_run else ""
+                print(f"  ✓  {tool['name']}  →  {dest_label}  ({created} created, {updated} updated)  {tag}")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print()
-    print(bold("  ── Summary ──"))
-    if args.dry_run:
-        print(f"  {yellow('Dry run complete. No files written.')}")
-    elif errors:
-        print(f"  {yellow('Done with')} {red(str(errors))} {yellow('error(s).')} Check output above.")
+    if total_errors:
+        print(f"  Done with {len(total_errors)} error(s). Check output above.")
     else:
         verb = "Uninstalled" if args.uninstall else "Installed"
-        print(f"  {green(f'{verb} successfully.')}")
+        print(f"  {verb} successfully.")
 
-    if not args.uninstall and not args.dry_run and not errors:
+    if not args.uninstall and not args.dry_run and not total_errors:
         if any(t["id"] == "claude" for t in selected_tools):
-            print(f"\n  Claude Code skills available as:")
-            for skill in (selected_skills or []):
-                print(f"    {dim('/')}dev-workflows:{skill}")
-        print(f"\n  {dim('Restart your agent to load new skills.')}")
+            print("\n  Claude Code skills available as:")
+            for skill in selected_skills:
+                print(f"    /dev-workflows:{skill}")
+        print("\n  Restart your agent to load new skills.")
 
 if __name__ == "__main__":
     main()
